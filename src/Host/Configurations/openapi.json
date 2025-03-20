@@ -1,0 +1,15 @@
+{
+  "components": {},
+  "info": {},
+  "openapi": "",
+  "SwaggerSettings": {
+    "Enable": true,
+    "Title": "CleanArchitectureBase WebAPI - Clean Architecture",
+    "Version": "1.0.0",
+    "Description": "CleanArchitectureBase Description"
+  },
+  "Versions": {
+    "MajorApiVersion": 1,
+    "MinorApiVersion": 0
+  }
+}
