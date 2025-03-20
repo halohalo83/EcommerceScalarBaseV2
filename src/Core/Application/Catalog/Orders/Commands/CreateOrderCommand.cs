@@ -20,7 +20,8 @@ namespace Application.Catalog.Orders.Commands
     public class CreateOrderCommandHandler(
         IUnitOfWork unitOfWork,
         IRedisCacheService redisCacheService,
-        IProductService productService) : IRequestHandler<CreateOrderCommand, long>
+        IProductService productService,
+        IReadRepository<Product> productReadRepository) : IRequestHandler<CreateOrderCommand, long>
     {
         private readonly IUnitOfWork _unitOfWork = unitOfWork;
         private readonly IRepository<Order> _orderRepository = unitOfWork.GetRepository<Order>();
@@ -72,54 +73,16 @@ namespace Application.Catalog.Orders.Commands
 
             foreach (var item in order.OrderItems)
             {
-                var productKey = $"product:{item.ProductId}";
-                var stock = await _redisCacheService.GetCacheValueAsync<int?>(productKey);
+                allProducts.TryGetValue(item.ProductId, out var product);
 
-                if (!stock.HasValue || stock.Value < item.Quantity)
+                if (product == null || product.Stock < item.Quantity)
                 {
-                    await FallbackToDatabaseCheck(order, allProducts, cancellationToken);
+                    await FallbackToDatabaseCheck(order, cancellationToken);
                     return;
                 }
             }
 
-            var keys = order.OrderItems.Select(item => (StackExchange.Redis.RedisKey)$"product:{item.ProductId}").ToArray();
-            var args = order.OrderItems.Select(item => (StackExchange.Redis.RedisValue)item.Quantity).ToArray();
-
-            string script = @"
-                local totalItems = #KEYS
-
-                for i = 1, totalItems do
-                    local productKey = KEYS[i]
-                    local quantity = tonumber(ARGV[i])
-
-                    local stock = tonumber(redis.call('GET', productKey))
-
-                    if stock == nil or stock < quantity then
-                        return 0 -- Stock not available
-                    end
-                end
-
-                for i = 1, totalItems do
-                    local productKey = KEYS[i]
-                    local quantity = tonumber(ARGV[i])
-
-                    redis.call('DECRBY', productKey, quantity)
-                end
-
-                return 1 -- Success
-            ";
-
-            var redisResult = await _redisCacheService.ScriptEvaluateAsync(script, keys, args);
-            long result = redisResult.IsNull ? 0 : long.Parse(redisResult.ToString());
-
-            if (result == 1)
-            {
-                await ProcessOrder(order, cancellationToken);
-            }
-            else
-            {
-                await FallbackToDatabaseCheck(order, allProducts, cancellationToken);
-            }
+            await ProcessOrder(order, cancellationToken);
         }
 
         private async Task<long> ProcessOrder(CreateOrderCommand request, CancellationToken cancellationToken)
@@ -140,7 +103,6 @@ namespace Application.Catalog.Orders.Commands
                     orderItemEntities.Add(OrderItem.Create(order.Id, item.ProductId, product.Price, item.Quantity));
 
                     product.UpdateStock(item.Quantity);
-                    await _redisCacheService.SetCacheValueAsync($"product:{item.ProductId}", product.Stock);
 
                     // Update AllProducts cache in Redis if it exists
                     var allProductCaches = await _redisCacheService.GetCacheValueAsync<IDictionary<long, ProductDto>>(RedisCacheConstants.AllProducts);
@@ -169,12 +131,20 @@ namespace Application.Catalog.Orders.Commands
             return order.Id;
         }
 
-        private async Task FallbackToDatabaseCheck(CreateOrderCommand request, IDictionary<long, ProductDto> allProducts, CancellationToken cancellationToken)
+        private async Task FallbackToDatabaseCheck(CreateOrderCommand request, CancellationToken cancellationToken)
         {
+            var allProducts = (await productReadRepository.ListAsync(cancellationToken)).ToDictionary(x => x.Id, x => x);
+
             foreach (var item in request.OrderItems)
             {
                 allProducts.TryGetValue(item.ProductId, out var product);
-                if (product == null || product.Stock < item.Quantity)
+
+                if(product == null)
+                {
+                    throw new Exception($"Product with id {item.ProductId} not found.");
+                }
+
+                if (product.Stock < item.Quantity)
                 {
                     throw new InvalidOperationException($"Insufficient stock for product {item.ProductId}. Available: {product?.Stock}, Requested: {item.Quantity}");
                 }
